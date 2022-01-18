@@ -1,161 +1,141 @@
 package main
 
 import (
+	"C"
 	"fmt"
+	"log"
 	"os"
 	"os/exec"
-	"os/signal"
-	"runtime"
-	"strconv"
+	"strings"
+	"sync"
 	"syscall"
+	"time"
+	"unsafe"
 
-	"golang.zx2c4.com/wireguard/tun"
+	"golang.org/x/net/ipv4"
+)
+
+// const (
+// 	ExitSetupSuccess = 0
+// 	ExitSetupFailed  = 1
+// )
+
+// const (
+// 	ENV_WG_TUN_FD             = "WG_TUN_FD"
+// 	ENV_WG_UAPI_FD            = "WG_UAPI_FD"
+// 	ENV_WG_PROCESS_FOREGROUND = "WG_PROCESS_FOREGROUND"
+// )
+
+const (
+	cIFFTUN  = 0x0001
+	cIFFTAP  = 0x0002
+	cIFFNOPI = 0x1000
+	IFNAMSIZ = 0x10
 )
 
 const (
-	ExitSetupSuccess = 0
-	ExitSetupFailed  = 1
+	// TUNSETIFF is from the syscall package which is the standard lib
+	TUNSETIFF = 0x400454ca
 )
 
 const (
-	ENV_WG_TUN_FD             = "WG_TUN_FD"
-	ENV_WG_UAPI_FD            = "WG_UAPI_FD"
-	ENV_WG_PROCESS_FOREGROUND = "WG_PROCESS_FOREGROUND"
+	SYS_IOCTL = 16
 )
 
-func printUsage() {
-	fmt.Printf("Usage: %s [-f/--foreground] INTERFACE-NAME\n", os.Args[0])
-}
-
-func warning() {
-	switch runtime.GOOS {
-	case "linux", "freebsd", "openbsd":
-		if os.Getenv(ENV_WG_PROCESS_FOREGROUND) == "1" {
-			return
-		}
-	default:
-		return
-	}
-
-	fmt.Fprintln(os.Stderr, "┌──────────────────────────────────────────────────────┐")
-	fmt.Fprintln(os.Stderr, "│                                                      │")
-	fmt.Fprintln(os.Stderr, "│   Running wireguard-go is not required because this  │")
-	fmt.Fprintln(os.Stderr, "│   kernel has first class support for WireGuard. For  │")
-	fmt.Fprintln(os.Stderr, "│   information on installing the kernel module,       │")
-	fmt.Fprintln(os.Stderr, "│   please visit:                                      │")
-	fmt.Fprintln(os.Stderr, "│         https://www.wireguard.com/install/           │")
-	fmt.Fprintln(os.Stderr, "│                                                      │")
-	fmt.Fprintln(os.Stderr, "└──────────────────────────────────────────────────────┘")
+type ifReq struct {
+	Name  [0x10]byte
+	Flags uint16
+	pad   [0x28 - 0x10 - 2]byte
 }
 
 func main() {
-	// if len(os.Args) == 2 && os.Args[1] == "--version" {
-	// 	fmt.Printf("wireguard-go v%s\n\nUserspace WireGuard daemon for %s-%s.\nInformation available at https://www.wireguard.com.\nCopyright (C) Jason A. Donenfeld <Jason@zx2c4.com>.\n", Version, runtime.GOOS, runtime.GOARCH)
-	// 	return
-	// }
 
-	// warning()
+	ifName := "mymy0"
 
-	var foreground bool
-	var interfaceName string
-	if len(os.Args) < 2 || len(os.Args) > 3 {
-		printUsage()
+	fd, err := syscall.Open("/dev/net/tun", os.O_RDWR|syscall.O_NONBLOCK, 0)
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	fdInt := uintptr(fd)
+
+	// Setup Fd
+
+	var flags uint16 = syscall.IFF_NO_PI
+	flags |= syscall.IFF_TUN
+
+	// Create an interface
+	var req ifReq
+
+	req.Flags = flags
+	copy(req.Name[:], ifName)
+
+	_, _, errno := syscall.Syscall(syscall.SYS_IOCTL, fdInt, uintptr(syscall.TUNSETIFF), uintptr(unsafe.Pointer(&req)))
+	if errno != 0 {
 		return
 	}
 
-	switch os.Args[1] {
+	createdIFName := strings.Trim(string(req.Name[:]), "\x00")
 
-	case "-f", "--foreground":
-		foreground = true
-		if len(os.Args) != 3 {
-			printUsage()
-			return
+	fmt.Printf("createdIFName: %s\n", createdIFName)
+
+	// if errno != 0 {
+	// 	log.Fatal(errno)
+	// }
+	// unix.SetNonblock(tunfd, true)
+
+	// fd := os.NewFile(uintptr(tunfd), "/dev/net/tun")
+
+	tunFd := os.NewFile(fdInt, "tun")
+
+	wait := sync.WaitGroup{}
+	wait.Add(1)
+
+	go func() {
+		var err error
+
+		// tunName := "cbnet0"
+		runIP("link", "set", "dev", ifName, "mtu", "1420")
+		runIP("addr", "add", "192.168.10.1/26", "dev", ifName)
+		runIP("link", "set", "dev", ifName, "up")
+
+		// c := exec.Command("sh", "-c", "ip link set up cheese && ip a a 192.168.9.2/24 dev cheese")
+		// c.Start()
+		// c.Wait()
+		// exec.Command("sh", "-c", "ping -c 4 -f 192.168.9.1; ip link set down cheese; ip a f dev cheese").Start()
+		time.Sleep(2 * time.Second)
+		b := [2000]byte{}
+		for {
+			n, err := tunFd.Read(b[:])
+			if err != nil {
+				break
+			}
+			fmt.Printf("Read %d bytes\n", n)
+			// b2 := b[:n]
+
+			// fmt.Printf("Str: %s\n", string(b2[20:]))
+
+			// fmt.Printf("Source: %s\n", net.IPv4(b2[12], b2[13], b2[14], b2[15]))
+			// fmt.Printf("Destination: %s\n", net.IPv4(b2[16], b2[17], b2[18], b2[19]))
+
+			header, _ := ipv4.ParseHeader(b[:n])
+			fmt.Printf("SRC: %+v\n", header.Src)
+			fmt.Printf("Des: %+v\n", header.Dst)
+
+			log.Printf("Header %+v\n", header)
 		}
-		interfaceName = os.Args[2]
-
-	default:
-		foreground = false
-		if len(os.Args) != 2 {
-			printUsage()
-			return
-		}
-		interfaceName = os.Args[1]
-	}
-
-	if !foreground {
-		foreground = os.Getenv(ENV_WG_PROCESS_FOREGROUND) == "1"
-	}
-
-	// get log level (default: info)
-
-	// logLevel := func() int {
-	// 	switch os.Getenv("LOG_LEVEL") {
-	// 	case "verbose", "debug":
-	// 		return device.LogLevelVerbose
-	// 	case "error":
-	// 		return device.LogLevelError
-	// 	case "silent":
-	// 		return device.LogLevelSilent
-	// 	}
-	// 	return device.LogLevelError
-	// }()
-
-	// open TUN device (or use supplied fd)
-
-	tun, err := func() (tun.Device, error) {
-		tunFdStr := os.Getenv(ENV_WG_TUN_FD)
-		if tunFdStr == "" {
-			return tun.CreateTUN(interfaceName, 1420)
-		}
-
-		// construct tun device from supplied fd
-
-		fd, err := strconv.ParseUint(tunFdStr, 10, 32)
-		if err != nil {
-			return nil, err
-		}
-
-		err = syscall.SetNonblock(int(fd), true)
-		if err != nil {
-			return nil, err
-		}
-
-		file := os.NewFile(uintptr(fd), "")
-		return tun.CreateTUNFromFile(file, 1420)
+		log.Print("Read errored: ", err)
+		wait.Done()
 	}()
-
-	if err == nil {
-		realInterfaceName, err2 := tun.Name()
-		if err2 == nil {
-			interfaceName = realInterfaceName
-		}
+	time.Sleep(time.Second * 15)
+	log.Print("Closing")
+	err = tunFd.Close()
+	if err != nil {
+		log.Print("Close errored: ", err)
 	}
+	wait.Wait()
+	log.Print("Exiting")
 
-	// Set interface parameters
-	runIP("link", "set", "dev", interfaceName, "mtu", strconv.Itoa(1420))
-	runIP("addr", "add", "192.168.10.1/28", "dev", interfaceName)
-	runIP("link", "set", "dev", interfaceName, "up")
-
-	// logger := device.NewLogger(
-	// 	logLevel,
-	// 	fmt.Sprintf("(%s) ", interfaceName),
-	// )
-
-	errs := make(chan error)
-	term := make(chan os.Signal, 1)
-
-	// wait for program to terminate
-
-	signal.Notify(term, syscall.SIGTERM)
-	signal.Notify(term, os.Interrupt)
-
-	select {
-	case <-term:
-	case <-errs:
-		// case <-device.Wait():
-	}
-
-	fmt.Println("Shutting down")
 }
 
 func runIP(args ...string) {
@@ -172,4 +152,5 @@ func runIP(args ...string) {
 		fmt.Println("Error running /sbin/ip:", err)
 	}
 
+	fmt.Println("End.........")
 }
